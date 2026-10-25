@@ -41,20 +41,45 @@ const frozenPlayers = new Map(); // playerId -> bool
 
 // ---------- Elo ratings ----------
 // Same formulas as the Desmos version:
-//   E(x,y) = 1 / (1 + 10^((y-x)/400))     K = 32 (flat, no placement matches)
+//   E(x,y) = 1 / (1 + 10^((y-x)/400))     K = 32 (flat)
 //   delta  = K * (s - E)                  new elo = max(0, elo + delta)
-// s = 1 win / 0 loss. Everyone starts at 0.
+// s = 1 win / 0 loss.
+// Placements: a new player is UNRATED (elo = null) for their first 5 matches. When the 5th match
+// ends their elo becomes (placement wins) * 240, so 5/5 wins = 1200. After that normal Elo applies.
+// An unrated opponent counts as UNRATED_ASSUMED_ELO in a rated player's Elo calculation.
 // A forfeit / disconnect during a running match counts as a loss. Cancelled matches (nobody
 // finished loading) are not rated.
-const START_ELO = 0;
+const PLACEMENT_MATCHES = 5;
+const PLACEMENT_ELO_PER_WIN = 240;
+const UNRATED_ASSUMED_ELO = 1000;
 const K_FACTOR = 32;
+
+// Matchmaking: a rated pair may play when their elo difference is within BOTH players' search
+// range. The range starts at +-250 and grows by 100 every 10 seconds in the queue. Unrated players
+// can be matched with anyone (other unrated players, or rated players below UNRATED_MAX_OPP_ELO).
+const MM_START_RANGE = 250;
+const MM_RANGE_STEP = 100;
+const MM_STEP_MS = Number(process.env.MM_STEP_MS) || 10000;
+const UNRATED_MAX_OPP_ELO = 2000;
 const RATINGS_FILE = process.env.RATINGS_FILE || pathLib.join(__dirname, "ratings.json");
 
 const eloExpected = (x, y) => 1 / (1 + 10 ** ((y - x) / 400));
 const eloDelta = (x, y, s) => Math.round(K_FACTOR * (s - eloExpected(x, y)));
 
-let ratings = {}; // playerId -> { elo, played, wins, name }
+const isRated = (r) => r.elo !== null && r.elo !== undefined;
+const effElo = (r) => (isRated(r) ? r.elo : UNRATED_ASSUMED_ELO);
+const pubElo = (r) => (isRated(r) ? r.elo : null);        // what clients see: null = unrated
+const placedOf = (r) => (isRated(r) ? null : r.played);   // placement matches played so far
+
+let ratings = {}; // playerId -> { elo (null = unrated), played, wins, pwins (placement wins), name }
 try { ratings = JSON.parse(fs.readFileSync(RATINGS_FILE, "utf8")); } catch { ratings = {}; }
+// Records from before placements existed: anyone with fewer than 5 matches goes back to unrated.
+for (const r of Object.values(ratings)) {
+  if (r.pwins === undefined) {
+    if ((r.played || 0) < PLACEMENT_MATCHES) { r.elo = null; r.pwins = Math.min(r.wins || 0, r.played || 0); }
+    else r.pwins = 0;
+  }
+}
 
 let saveTimer = null;
 function saveRatings() {
@@ -72,10 +97,21 @@ function saveRatings() {
 function getRating(id, name) {
   let r = ratings[id];
   if (!r) {
-    r = ratings[id] = { elo: START_ELO, played: 0, wins: 0, name: name || id };
+    r = ratings[id] = { elo: null, played: 0, wins: 0, pwins: 0, name: name || id };
     saveRatings();
   }
   return r;
+}
+
+function applyResult(r, oppElo, won) {
+  if (isRated(r)) {
+    r.elo = Math.max(0, r.elo + eloDelta(r.elo, oppElo, won ? 1 : 0));
+  } else {
+    if (won) r.pwins = (r.pwins || 0) + 1;
+    if (r.played + 1 >= PLACEMENT_MATCHES) r.elo = (r.pwins || 0) * PLACEMENT_ELO_PER_WIN;
+  }
+  r.played++;
+  if (won) r.wins++;
 }
 
 // Top 100 by Elo. Only display names go out, never player ids; "you" is flagged server-side
@@ -85,16 +121,17 @@ const shownName = (id, r) => (!r.name || r.name === id ? "Unknown" : r.name);
 
 function buildLeaderboard(me) {
   const all = Object.entries(ratings)
-    .filter(([, r]) => r.played > 0)
+    .filter(([, r]) => isRated(r))
     .map(([id, r]) => ({ id, name: shownName(id, r), elo: r.elo, wins: r.wins || 0, played: r.played }))
     .sort((x, y) => y.elo - x.elo || y.wins - x.wins || x.played - y.played);
   const top = all.slice(0, LEADERBOARD_SIZE).map((e, i) => ({ pos: i + 1, name: e.name, elo: e.elo, you: e.id === me.id }));
   const idx = all.findIndex((e) => e.id === me.id);
   const mine = ratings[me.id];
   const you = {
-    pos: idx === -1 ? null : idx + 1, // null = hasn't played a ranked match yet
+    pos: idx === -1 ? null : idx + 1, // null = still unrated (placements)
     name: mine ? shownName(me.id, mine) : "Unknown",
-    elo: mine ? mine.elo : 0,
+    elo: mine ? pubElo(mine) : null,
+    placed: mine ? placedOf(mine) : 0,
   };
   return { top, you, total: all.length };
 }
@@ -171,9 +208,41 @@ function pickMaps() {
   return pool.slice(0, MAPS_PER_MATCH);
 }
 
+// Current search range of a queued player (+- this many elo).
+function searchRange(p, now) {
+  return MM_START_RANGE + MM_RANGE_STEP * Math.floor((now - (p.queuedAt || now)) / MM_STEP_MS);
+}
+
+function compatible(p, q, now) {
+  const rp = getRating(p.id, p.name), rq = getRating(q.id, q.name);
+  if (!isRated(rp) && !isRated(rq)) return true;                    // both unrated
+  if (!isRated(rp)) return rq.elo < UNRATED_MAX_OPP_ELO;            // unrated vs rated
+  if (!isRated(rq)) return rp.elo < UNRATED_MAX_OPP_ELO;
+  return Math.abs(rp.elo - rq.elo) <= Math.min(searchRange(p, now), searchRange(q, now));
+}
+
+// Longest-waiting player first; each gets the closest compatible opponent.
 function tryMatch() {
-  while (queue.length >= 2) {
-    createMatch(queue.shift(), queue.shift());
+  const now = Date.now();
+  let found = true;
+  while (found && queue.length >= 2) {
+    found = false;
+    for (let i = 0; i < queue.length && !found; i++) {
+      let best = -1, bestDiff = Infinity;
+      for (let j = 0; j < queue.length; j++) {
+        if (j === i || !compatible(queue[i], queue[j], now)) continue;
+        const d = Math.abs(effElo(getRating(queue[i].id)) - effElo(getRating(queue[j].id)));
+        if (d < bestDiff) { best = j; bestDiff = d; }
+      }
+      if (best !== -1) {
+        const p = queue[i], q = queue[best];
+        queue.splice(Math.max(i, best), 1);
+        queue.splice(Math.min(i, best), 1);
+        console.log(`Matchmaking: ${p.name} (${pubElo(getRating(p.id))}) vs ${q.name} (${pubElo(getRating(q.id))}), ranges ${searchRange(p, now)}/${searchRange(q, now)}`);
+        createMatch(p, q);
+        found = true;
+      }
+    }
   }
 }
 
@@ -198,8 +267,8 @@ function createMatch(a, b) {
   }
     match.readyTimer = setTimeout(() => cancelMatch(match, "ready_timeout"), READY_TIMEOUT_MS);
   const ra = getRating(a.id, a.name), rb = getRating(b.id, b.name);
-  send(a, { type: "match_found", matchId: match.id, maps: match.maps, opponent: b.id, opponentName: b.name, seed: match.seed.toString(), elo: ra.elo, opponentElo: rb.elo, playerName: a.name });
-  send(b, { type: "match_found", matchId: match.id, maps: match.maps, opponent: a.id, opponentName: a.name, seed: match.seed.toString(), elo: rb.elo, opponentElo: ra.elo, playerName: b.name });
+  send(a, { type: "match_found", matchId: match.id, maps: match.maps, opponent: b.id, opponentName: b.name, seed: match.seed.toString(), elo: pubElo(ra), opponentElo: pubElo(rb), placed: placedOf(ra), opponentPlaced: placedOf(rb), playerName: a.name });
+  send(b, { type: "match_found", matchId: match.id, maps: match.maps, opponent: a.id, opponentName: a.name, seed: match.seed.toString(), elo: pubElo(rb), opponentElo: pubElo(ra), placed: placedOf(rb), opponentPlaced: placedOf(ra), playerName: b.name });
 }
 
 function cancelMatch(match, reason) {
@@ -241,15 +310,14 @@ function endMatch(match, winner, reason) {
   const aTotal = aSplits.length > 0 && aSplits[aSplits.length - 1] ? aSplits[aSplits.length - 1] : 0;
   const bTotal = bSplits.length > 0 && bSplits[bSplits.length - 1] ? bSplits[bSplits.length - 1] : 0;
 
-  // Rate the match. Both deltas are computed from the pre-match ratings.
+  // Rate the match. Both sides use the opponent's PRE-match rating.
   const ra = getRating(a.id, a.name), rb = getRating(b.id, b.name);
-  const before = { [a.id]: ra.elo, [b.id]: rb.elo };
-  const dA = eloDelta(ra.elo, rb.elo, winner === a ? 1 : 0);
-  const dB = eloDelta(rb.elo, ra.elo, winner === b ? 1 : 0);
-  ra.elo = Math.max(0, ra.elo + dA); ra.played++; if (winner === a) ra.wins++;
-  rb.elo = Math.max(0, rb.elo + dB); rb.played++; if (winner === b) rb.wins++;
+  const before = { [a.id]: pubElo(ra), [b.id]: pubElo(rb) };
+  const oppOfA = effElo(rb), oppOfB = effElo(ra);
+  applyResult(ra, oppOfA, winner === a);
+  applyResult(rb, oppOfB, winner === b);
   saveRatings();
-  console.log(`Match ${match.id} rated: ${a.name} ${before[a.id]} -> ${ra.elo}, ${b.name} ${before[b.id]} -> ${rb.elo}`);
+  console.log(`Match ${match.id} rated: ${a.name} ${before[a.id]} -> ${pubElo(ra)}, ${b.name} ${before[b.id]} -> ${pubElo(rb)}`);
 
   for (const p of match.players) {
     const won = p === winner;
@@ -270,11 +338,13 @@ function endMatch(match, winner, reason) {
       splits: pSplits,
       oppSplits: oppSplits,
       oppTimeMs: oppTotal,
-      eloBefore: before[p.id],
-      eloAfter: mine.elo,
-      eloDelta: mine.elo - before[p.id],
-      oppEloAfter: theirs.elo,
-      played: mine.played
+      eloBefore: before[p.id],                 // null = was unrated
+      eloAfter: pubElo(mine),                  // null = still unrated
+      eloDelta: (before[p.id] !== null && isRated(mine)) ? mine.elo - before[p.id] : null,
+      oppEloAfter: pubElo(theirs),
+      played: mine.played,
+      placed: placedOf(mine),                  // placement matches played, only while unrated
+      placementWins: mine.pwins || 0
     });
   }
   matches.delete(match.id);
@@ -306,6 +376,7 @@ function dropPlayer(p) {
 
 function doQueue(p) {
   if (p.matchId || queue.includes(p)) return;
+  p.queuedAt = Date.now();
   queue.push(p);
   send(p, { type: "queued" });
   tryMatch();
@@ -417,7 +488,7 @@ const server = http.createServer(async (req, res) => {
       sessions.set(p.token, p);
       const rating = getRating(id, name);
       rating.name = name;
-      return json(res, 200, { token: p.token, elo: rating.elo, played: rating.played });
+      return json(res, 200, { token: p.token, elo: pubElo(rating), placed: placedOf(rating), played: rating.played });
     }
 
     const player = sessions.get(req.headers["x-token"]);
@@ -492,6 +563,9 @@ const server = http.createServer(async (req, res) => {
     json(res, 500, { error: "server_error" });
   }
 });
+
+// Search ranges widen with time, so re-check the queue regularly.
+setInterval(tryMatch, 1000);
 
 // Disconnect detection: a player who isn't holding a poll and hasn't been seen recently is gone.
 setInterval(() => {
